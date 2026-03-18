@@ -41,3 +41,5 @@ If you connect this repo in Netlify:
 - Publish directory: `dist`
 
 After deploy, the app is fully static and runs in-browser.
+
+Accessible here: https://perge.netlify.app/ 
