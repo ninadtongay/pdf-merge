@@ -28,9 +28,11 @@ GlobalWorkerOptions.workerSrc = pdfWorkerSrc
 const THUMBNAIL_WIDTH = 230
 const PREVIEW_MAX_WIDTH = 1100
 
-type SourcePdf = {
+type SourceFile = {
   id: string
   name: string
+  kind: 'pdf' | 'image'
+  mime: string
   bytes: Uint8Array
 }
 
@@ -42,6 +44,7 @@ type PageTile = {
   pageNumber: number
   thumbnail: string
   rotation: number
+  kind: 'pdf' | 'image'
 }
 
 type ExportMode = 'original' | 'compressed'
@@ -254,10 +257,64 @@ function wipeByteArray(bytes: Uint8Array) {
   }
 }
 
-function wipeSourceBytes(sources: SourcePdf[]) {
+function wipeSourceBytes(sources: SourceFile[]) {
   for (const source of sources) {
     wipeByteArray(source.bytes)
   }
+}
+
+function isPdfFile(file: File) {
+  return (
+    file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+  )
+}
+
+function isAcceptedImageFile(file: File) {
+  return (
+    /^image\//i.test(file.type) ||
+    /\.(jpe?g|png|webp|gif|bmp|avif)$/i.test(file.name)
+  )
+}
+
+async function renderImageToCanvas(
+  bytes: Uint8Array,
+  mime: string,
+  targetWidth?: number,
+): Promise<HTMLCanvasElement> {
+  return new Promise((resolve, reject) => {
+    const blob = new Blob([new Uint8Array(bytes)], { type: mime })
+    const url = URL.createObjectURL(blob)
+    const img = new Image()
+
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+
+      try {
+        const scale = targetWidth != null ? targetWidth / img.naturalWidth : 1
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.max(1, Math.floor(img.naturalWidth * scale))
+        canvas.height = Math.max(1, Math.floor(img.naturalHeight * scale))
+        const context = canvas.getContext('2d')
+
+        if (!context) {
+          reject(new Error('This browser cannot render image previews.'))
+          return
+        }
+
+        context.drawImage(img, 0, 0, canvas.width, canvas.height)
+        resolve(canvas)
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('Failed to decode image.'))
+    }
+
+    img.src = url
+  })
 }
 
 type SortablePageCardProps = {
@@ -313,7 +370,9 @@ function SortablePageCard({
         <p className="page-card__name" title={page.sourceName}>
           {page.sourceName}
         </p>
-        <p className="page-card__page">Page {page.pageNumber}</p>
+        <p className="page-card__page">
+          {page.kind === 'image' ? 'Image' : `Page ${page.pageNumber}`}
+        </p>
         {page.rotation > 0 ? (
           <p className="page-card__rotation">Rotated {page.rotation} deg</p>
         ) : (
@@ -361,7 +420,7 @@ function SortablePageCard({
 }
 
 function App() {
-  const [sourcePdfs, setSourcePdfs] = useState<SourcePdf[]>([])
+  const [sourcePdfs, setSourcePdfs] = useState<SourceFile[]>([])
   const [pageTiles, setPageTiles] = useState<PageTile[]>([])
   const [importRangeInput, setImportRangeInput] = useState('')
   const [exportMode, setExportMode] = useState<ExportMode>('original')
@@ -460,6 +519,38 @@ function App() {
     previewRequestRef.current = requestId
     setPreviewDataUrl(null)
     setPreviewLoading(true)
+
+    if (tile.kind === 'image') {
+      try {
+        const previewCanvas = await renderImageToCanvas(
+          source.bytes,
+          source.mime,
+          PREVIEW_MAX_WIDTH,
+        )
+        const rotatedCanvas = rotateCanvas(previewCanvas, tile.rotation)
+        const dataUrl = rotatedCanvas.toDataURL('image/jpeg', 0.92)
+
+        if (previewRequestRef.current !== requestId) {
+          return
+        }
+
+        previewCacheRef.current.set(cacheKey, dataUrl)
+        setPreviewDataUrl(dataUrl)
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'Unable to render image preview.'
+
+        if (previewRequestRef.current === requestId) {
+          setPreviewError(message)
+        }
+      } finally {
+        if (previewRequestRef.current === requestId) {
+          setPreviewLoading(false)
+        }
+      }
+
+      return
+    }
 
     let previewDoc: PDFDocumentProxy | null = null
 
@@ -576,100 +667,147 @@ function App() {
   }
 
   const importFiles = async (incomingFiles: File[]) => {
-    const pdfFiles = incomingFiles.filter((file) => {
-      return (
-        file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
-      )
-    })
+    const validFiles = incomingFiles.filter(
+      (file) => isPdfFile(file) || isAcceptedImageFile(file),
+    )
 
-    if (pdfFiles.length === 0) {
-      setErrorMessage('Please upload at least one PDF file.')
+    if (validFiles.length === 0) {
+      setErrorMessage(
+        'Please upload PDF or image files (JPEG, PNG, WebP, GIF, BMP, AVIF).',
+      )
       return
     }
 
     setErrorMessage(null)
     setIsImporting(true)
 
-    const nextSources: SourcePdf[] = []
+    const nextSources: SourceFile[] = []
     const nextTiles: PageTile[] = []
     const parseErrors: string[] = []
 
     const selectedRangeText = importRangeInput.trim()
 
-    for (const file of pdfFiles) {
+    for (const file of validFiles) {
       const sourceId = makeId()
       let sourceBytes: Uint8Array | null = null
       let keepSourceBytes = false
 
-      try {
-        setStatusMessage(`Reading ${file.name}...`)
-
-        sourceBytes = new Uint8Array(await file.arrayBuffer())
-        const { doc: previewDoc } = await openPdfDocumentWithPrompt(
-          sourceBytes,
-          file.name,
-        )
-
+      if (isAcceptedImageFile(file) && !isPdfFile(file)) {
         try {
-          const selectedIndexes = parsePageRange(selectedRangeText, previewDoc.numPages)
-          const fileTiles: PageTile[] = []
-
-          for (
-            let selectedIndex = 0;
-            selectedIndex < selectedIndexes.length;
-            selectedIndex += 1
-          ) {
-            const pageIndex = selectedIndexes[selectedIndex]
-            const pageNumber = pageIndex + 1
-
-            setStatusMessage(
-              `Rendering ${file.name}: page ${selectedIndex + 1}/${selectedIndexes.length}`,
-            )
-
-            const page = await previewDoc.getPage(pageNumber)
-
-            try {
-              const baseViewport = page.getViewport({ scale: 1 })
-              const scale = Math.min(1.25, THUMBNAIL_WIDTH / baseViewport.width)
-              const renderedCanvas = await renderPageToCanvas(page, scale)
-
-              fileTiles.push({
-                id: makeId(),
-                sourceId,
-                sourceName: file.name,
-                pageIndex,
-                pageNumber,
-                thumbnail: renderedCanvas.toDataURL('image/jpeg', 0.75),
-                rotation: 0,
-              })
-            } finally {
-              page.cleanup()
-            }
-          }
-
-          if (fileTiles.length === 0) {
-            throw new Error('No readable pages were found in this file.')
-          }
+          setStatusMessage(`Loading image: ${file.name}...`)
+          sourceBytes = new Uint8Array(await file.arrayBuffer())
+          const mime = file.type || 'image/jpeg'
+          const thumbnailCanvas = await renderImageToCanvas(
+            sourceBytes,
+            mime,
+            THUMBNAIL_WIDTH,
+          )
 
           nextSources.push({
             id: sourceId,
             name: file.name,
+            kind: 'image',
+            mime,
             bytes: sourceBytes,
           })
           keepSourceBytes = true
 
-          nextTiles.push(...fileTiles)
+          nextTiles.push({
+            id: makeId(),
+            sourceId,
+            sourceName: file.name,
+            pageIndex: 0,
+            pageNumber: 1,
+            thumbnail: thumbnailCanvas.toDataURL('image/jpeg', 0.75),
+            rotation: 0,
+            kind: 'image',
+          })
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : 'Unable to load this image.'
+          parseErrors.push(`${file.name}: ${message}`)
         } finally {
-          previewDoc.cleanup()
-          await previewDoc.destroy()
+          if (!keepSourceBytes && sourceBytes) {
+            wipeByteArray(sourceBytes)
+          }
         }
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : 'Unable to parse this PDF file.'
-        parseErrors.push(`${file.name}: ${message}`)
-      } finally {
-        if (!keepSourceBytes && sourceBytes) {
-          wipeByteArray(sourceBytes)
+      } else {
+        try {
+          setStatusMessage(`Reading ${file.name}...`)
+
+          sourceBytes = new Uint8Array(await file.arrayBuffer())
+          const { doc: previewDoc } = await openPdfDocumentWithPrompt(
+            sourceBytes,
+            file.name,
+          )
+
+          try {
+            const selectedIndexes = parsePageRange(
+              selectedRangeText,
+              previewDoc.numPages,
+            )
+            const fileTiles: PageTile[] = []
+
+            for (
+              let selectedIndex = 0;
+              selectedIndex < selectedIndexes.length;
+              selectedIndex += 1
+            ) {
+              const pageIndex = selectedIndexes[selectedIndex]
+              const pageNumber = pageIndex + 1
+
+              setStatusMessage(
+                `Rendering ${file.name}: page ${selectedIndex + 1}/${selectedIndexes.length}`,
+              )
+
+              const page = await previewDoc.getPage(pageNumber)
+
+              try {
+                const baseViewport = page.getViewport({ scale: 1 })
+                const scale = Math.min(1.25, THUMBNAIL_WIDTH / baseViewport.width)
+                const renderedCanvas = await renderPageToCanvas(page, scale)
+
+                fileTiles.push({
+                  id: makeId(),
+                  sourceId,
+                  sourceName: file.name,
+                  pageIndex,
+                  pageNumber,
+                  thumbnail: renderedCanvas.toDataURL('image/jpeg', 0.75),
+                  rotation: 0,
+                  kind: 'pdf',
+                })
+              } finally {
+                page.cleanup()
+              }
+            }
+
+            if (fileTiles.length === 0) {
+              throw new Error('No readable pages were found in this file.')
+            }
+
+            nextSources.push({
+              id: sourceId,
+              name: file.name,
+              kind: 'pdf',
+              mime: 'application/pdf',
+              bytes: sourceBytes,
+            })
+            keepSourceBytes = true
+
+            nextTiles.push(...fileTiles)
+          } finally {
+            previewDoc.cleanup()
+            await previewDoc.destroy()
+          }
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : 'Unable to parse this PDF file.'
+          parseErrors.push(`${file.name}: ${message}`)
+        } finally {
+          if (!keepSourceBytes && sourceBytes) {
+            wipeByteArray(sourceBytes)
+          }
         }
       }
     }
@@ -686,11 +824,14 @@ function App() {
         summary += ' Imported using your page range selection.'
       }
 
-      summary += ' Protected files may ask password again during preview or merge.'
+      if (nextSources.some((source) => source.kind === 'pdf')) {
+        summary +=
+          ' Password-protected PDFs may ask password again during preview or merge.'
+      }
 
       setStatusMessage(summary)
     } else {
-      setStatusMessage('No pages were added. Try another PDF file.')
+      setStatusMessage('No pages were added. Try another PDF or image file.')
     }
 
     if (parseErrors.length > 0) {
@@ -737,7 +878,7 @@ function App() {
 
   const rasterizeTileForMerge = async (
     tile: PageTile,
-    source: SourcePdf,
+    source: SourceFile,
     rasterDocCache: Map<string, PDFDocumentProxy>,
     passwordCache: Map<string, string>,
   ) => {
@@ -805,6 +946,28 @@ function App() {
         const source = sourceLookup.get(tile.sourceId)
 
         if (!source) {
+          continue
+        }
+
+        if (tile.kind === 'image') {
+          const imageCanvas = await renderImageToCanvas(source.bytes, source.mime)
+          const rotatedCanvas = rotateCanvas(imageCanvas, tile.rotation)
+          const jpegQuality = clampNumber(rasterQuality / 100, 0.45, 0.95)
+          const jpegBytes = dataUrlToUint8Array(
+            rotatedCanvas.toDataURL('image/jpeg', jpegQuality),
+          )
+          const embeddedImage = await mergedPdf.embedJpg(jpegBytes)
+          const imagePage = mergedPdf.addPage([
+            rotatedCanvas.width,
+            rotatedCanvas.height,
+          ])
+          imagePage.drawImage(embeddedImage, {
+            x: 0,
+            y: 0,
+            width: rotatedCanvas.width,
+            height: rotatedCanvas.height,
+          })
+          setStatusMessage(`Merging ${index + 1}/${pageTiles.length} pages...`)
           continue
         }
 
@@ -940,7 +1103,7 @@ function App() {
         <input
           ref={fileInputRef}
           type="file"
-          accept="application/pdf"
+          accept="application/pdf,image/jpeg,image/png,image/webp,image/gif,image/bmp,image/avif"
           multiple
           className="upload-panel__input"
           onChange={onFileInputChange}
@@ -972,7 +1135,8 @@ function App() {
         <div className="upload-panel__meta">
           <span>Mobile friendly drag-and-drop</span>
           <span>Page-level sorting</span>
-          <span>Password-protected support</span>
+          <span>Mix images with PDFs</span>
+          <span>Password-protected PDFs</span>
         </div>
       </section>
 
@@ -1086,8 +1250,8 @@ function App() {
         <section className="empty-state" aria-live="polite">
           <h2>No pages loaded yet</h2>
           <p>
-            Add PDFs and this area will become a sortable board. Drag any card to
-            reorder pages before merging.
+            Add PDFs or images and this area will become a sortable board. Drag any
+            card to reorder before merging.
           </p>
         </section>
       ) : (
@@ -1153,8 +1317,9 @@ function App() {
             <div className="help-modal__body">
               <ol className="help-modal__list">
                 <li>
-                  Upload one or many PDFs. You can optionally set page range input
-                  first, for example 1-3,5,8-.
+                  Upload PDFs and/or images (JPEG, PNG, WebP, GIF, BMP, AVIF). You
+                  can mix them freely. For PDFs, optionally set a page range first,
+                  for example 1-3,5,8-.
                 </li>
                 <li>
                   Each selected page appears as a card. Drag cards to reorder, rotate
