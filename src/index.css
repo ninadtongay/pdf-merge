@@ -1,0 +1,49 @@
+@import '@fontsource-variable/lora';
+@import '@fontsource-variable/sora';
+
+:root {
+  font-family: 'Lora Variable', Georgia, serif;
+  line-height: 1.48;
+  font-weight: 410;
+  color: #211c17;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 7% -10%, rgba(255, 192, 111, 0.36) 0%, transparent 42%),
+    radial-gradient(circle at 95% 0%, rgba(94, 234, 212, 0.2) 0%, transparent 44%),
+    linear-gradient(180deg, #f8f3e8 0%, #efe7d8 100%);
+  color: #211c17;
+}
+
+#root {
+  min-height: 100dvh;
+  width: 100%;
+  padding: clamp(0.85rem, 2.2vw, 2rem);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(194, 65, 12, 0.24);
+  color: #24180f;
+}
