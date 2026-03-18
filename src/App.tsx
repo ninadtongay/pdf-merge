@@ -1088,7 +1088,7 @@ function App() {
         <p className="hero-panel__eyebrow">PERGE</p>
         <h1>PDF Merger</h1>
         <p>
-          Drop one or many PDFs, reorder every page visually, remove anything you do
+          Drop one or many PDFs or images, reorder every page visually, remove anything you do
           not need, then download a fresh combined file.
         </p>
       </section>
